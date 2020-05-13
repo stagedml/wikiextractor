@@ -598,8 +598,6 @@ class Extractor(object):
         """
         :param out: a memory file.
         """
-        logging.info('%s\t%s', self.id, self.title)
-
         # Separate header from text with a newline.
         if options.toHTML:
             title_str = '<h1>' + self.title + '</h1>'
@@ -2940,20 +2938,20 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
     worker_count = process_count
 
     # load balancing
-    max_spool_length = 10000
-    spool_length = Value('i', 0, lock=False)
+    # max_spool_length = 10000
+    # spool_length = Value('i', 0, lock=False)
 
     # reduce job that sorts and prints output
     reduce = Process(target=reduce_process,
-                     args=(options, output_queue, spool_length,
-                           out_file, file_size, file_compress))
+                     args=(options, output_queue,
+                           out_file, file_size, file_compress, worker_count))
     reduce.start()
 
     # initialize jobs queue
-    jobs_queue = Queue(maxsize=maxsize)
+    jobs_queue:Queue = Queue(maxsize=maxsize)
 
     # start worker processes
-    logging.info("Using %d extract processes.", worker_count)
+    logging.info("M Using %d extract processes.", worker_count)
     workers = []
     for i in range(worker_count):
         extractor = Process(target=extract_process,
@@ -2967,20 +2965,17 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
     for page_data in pages_from(input):
         id, revid, title, ns, catSet, page = page_data
         if keepPage(ns, catSet, page):
-            # slow down
-            delay = 0
-            if spool_length.value > max_spool_length:
-                # reduce to 10%
-                while spool_length.value > max_spool_length/10:
-                    time.sleep(10)
-                    delay += 10
-            if delay:
-                logging.info('Delay %ds', delay)
             job = (id, revid, title, page, page_num)
+            logging.info("M dispatching %s (page_num %d)", id,
+                page_num)
             jobs_queue.put(job) # goes to any available extract_process
             page_num += 1
+        else:
+            logging.info("M skipping %s", id)
+
         page = None             # free memory
 
+    logging.info("M done")
     input.close()
 
     # signal termination
@@ -2988,12 +2983,14 @@ def process_dump(input_file, template_file, out_file, file_size, file_compress,
         jobs_queue.put(None)
     # wait for workers to terminate
     for w in workers:
-        w.join()
+        w.join(timeout=30)
+        if w.is_alive():
+            w.terminate()
 
     # signal end of work to reduce process
     output_queue.put(None)
     # wait for it to finish
-    reduce.join()
+    reduce.join(timeout=30)
 
     extract_duration = default_timer() - extract_start
     extract_rate = page_num / extract_duration
@@ -3020,32 +3017,33 @@ def extract_process(opts, i, jobs_queue, output_queue):
 
     out = StringIO()                 # memory buffer
 
-
     while True:
         job = jobs_queue.get()  # job is (id, title, page, page_num)
-        if job:
-            id, revid, title, page, page_num = job
-            try:
-                e = Extractor(*job[:4]) # (id, revid, title, page)
-                page = None              # free memory
-                e.extract(out)
-                text = out.getvalue()
-            except:
-                text = ''
-                logging.exception('Processing page: %s %s', id, title)
-
-            output_queue.put((page_num, text))
-            out.truncate(0)
-            out.seek(0)
-        else:
-            logging.debug('Quit extractor')
+        if job is None:
             break
+        id, revid, title, page, page_num = job
+        logging.info('#%d %s %s len_page %d', i, id, title, len(page))
+        try:
+            e = Extractor(*job[:4]) # (id, revid, title, page)
+            page = None             # free memory
+            e.extract(out)
+            text = out.getvalue()
+        except:
+            text = ''
+            logging.exception('Processing page: %s %s', id, title)
+
+        logging.info('#%d %s %s DONE', i, id, title)
+        output_queue.put((page_num, text))
+        out.truncate(0)
+        out.seek(0)
+
     out.close()
 
 
-report_period = 10000           # progress report period
-def reduce_process(opts, output_queue, spool_length,
-                   out_file=None, file_size=0, file_compress=True):
+report_period = 100           # progress report period
+def reduce_process(opts, output_queue,
+                   out_file=None, file_size=0, file_compress=True,
+                   worker_count=None):
     """Pull finished article text, write series of files (or stdout)
     :param opts: global parameters.
     :param output_queue: text to be output.
@@ -3066,40 +3064,29 @@ def reduce_process(opts, output_queue, spool_length,
     else:
         output = sys.stdout if PY2 else sys.stdout.buffer
         if file_compress:
-            logging.warn("writing to stdout, so no output compression (use an external tool)")
+            logging.warn(("writing to stdout, so no output compression "
+                          "(use an external tool)"))
 
-    interval_start = default_timer()
-    # FIXME: use a heap
-    spool = {}        # collected pages
-    next_page = 0     # sequence numbering of page
-    while True:
-        if next_page in spool:
-            output.write(spool.pop(next_page).encode('utf-8'))
-            next_page += 1
-            # tell mapper our load:
-            spool_length.value = len(spool)
-            # progress report
-            if next_page % report_period == 0:
-                interval_rate = report_period / (default_timer() - interval_start)
-                logging.info("Extracted %d articles (%.1f art/s)",
-                             next_page, interval_rate)
-                interval_start = default_timer()
-        else:
-            # mapper puts None to signal finish
+    try:
+        interval_start = default_timer()
+        pages_written = 0
+        while True:
             pair = output_queue.get()
-            if not pair:
+            if pair is None:
                 break
             page_num, text = pair
-            spool[page_num] = text
-            # tell mapper our load:
-            spool_length.value = len(spool)
-            # FIXME: if an extractor dies, process stalls; the other processes
-            # continue to produce pairs, filling up memory.
-            if len(spool) > 200:
-                logging.debug('Collected %d, waiting: %d, %d', len(spool),
-                              next_page, next_page == page_num)
-    if output != sys.stdout:
-        output.close()
+            output.write(text.encode('utf-8'))
+
+            pages_written+=1
+            if pages_written % report_period == 0:
+                interval_rate = report_period / (default_timer() - interval_start)
+                logging.info("S Extracted %d articles (%.1f art/s)",
+                             pages_written, interval_rate)
+                interval_start = default_timer()
+
+    finally:
+        if output != sys.stdout:
+            output.close()
 
 
 # ----------------------------------------------------------------------

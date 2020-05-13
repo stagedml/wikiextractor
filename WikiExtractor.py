@@ -1225,7 +1225,12 @@ def findMatchingBraces(text, ldelim=0):
         reNext = re.compile('{{2,}|}{2,}|\[{2,}|]{2,}')  # at least 2
 
     cur = 0
+    max_while=10000
     while True:
+        max_while-=1
+        if max_while<=0:
+            logging.warn("Exiting from while1 in findMatchingBraces")
+            return
         m1 = reOpen.search(text, cur)
         if not m1:
             return
@@ -1235,7 +1240,12 @@ def findMatchingBraces(text, ldelim=0):
         else:
             stack = [-lmatch]  # negative means [
         end = m1.end()
+        max_while2=10000
         while True:
+            max_while2-=1
+            if max_while2<=0:
+                logging.warn("Exiting from while2 in findMatchingBraces")
+                return
             m2 = reNext.search(text, end)
             if not m2:
                 return  # unbalanced
@@ -1270,7 +1280,12 @@ def findMatchingBraces(text, ldelim=0):
             elif brac == '[':  # [[
                 stack.append(-lmatch)
             else:  # ]]
+                max_while3=10000
                 while stack and stack[-1] < 0:  # matching [[
+                    max_while3-=1
+                    if max_while3<=0:
+                        logging.warn("Exiting from while3 in findMatchingBraces")
+                        return
                     openCount = -stack.pop()
                     if lmatch >= openCount:
                         lmatch -= openCount
@@ -1306,7 +1321,12 @@ def findBalanced(text, openDelim=['[['], closeDelim=[']]']):
     startSet = False
     startPat = re.compile(openPat)
     nextPat = startPat
+    max_while=10000
     while True:
+        max_while-=1
+        if max_while<=0:
+            logging.warn("Exiting from while in findBalanced")
+            return
         next = nextPat.search(text, cur)
         if not next:
             return
@@ -2038,10 +2058,15 @@ def dropNested(text, openDelim, closeDelim):
         return text
     end = closeRE.search(text, start.end())
     next = start
+    max_while=10000
     while end:
+        max_while-=1
+        if max_while<=0:
+            logging.warn("Exiting from while in dropNested")
+            break
         next = openRE.search(text, next.end())
         if not next:            # termination
-            while nest:         # close all pending
+            while nest>0:         # close all pending
                 nest -= 1
                 end0 = closeRE.search(text, end.end())
                 if end0:
